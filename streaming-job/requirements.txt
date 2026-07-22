@@ -1,0 +1,5 @@
+pyspark==3.5.1
+pymysql==1.1.0
+cryptography==42.0.8
+numpy==1.26.4
+pandas==2.1.1

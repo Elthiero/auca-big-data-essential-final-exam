@@ -1,0 +1,277 @@
+# =========================================================================
+# Big Data Essentials — eCommerce Purchase Prediction
+# Hadoop (NameNode+DataNode, data lake) -> Kafka (KRaft) -> Spark (local)
+#   -> MySQL (registry + predictions) -> Django
+#
+# Data flow:
+#   - 2019-10 loaded into HDFS once -> used by training-job (Champion v1)
+#   - 2019-11 replayed by ingestion-job through Kafka -> scored live by
+#     streaming-job -> raw events + predictions also written to HDFS as
+#     Parquet -> training-job later retrains on Oct+Nov -> Challenger
+#
+# Storage split:
+#   - HDFS: raw event data (Parquet), streamed data (Parquet), model
+#     artifacts (Champion + Challengers), Structured Streaming checkpoints
+#   - MySQL: model_registry (pointers + metrics only, no blobs), predictions
+#
+# Notes:
+# - Zookeeper removed: Kafka runs in KRaft mode (self-managed metadata).
+# - Spark Master/Worker removed: each job runs PySpark in local[*] mode.
+# - NameNode + DataNode remain 2 containers: standard bde2020 images
+#   require it.
+# =========================================================================
+
+networks:
+  bigdata-net:
+    driver: bridge
+
+volumes:
+  hadoop_namenode:
+  hadoop_datanode:
+  mysql_data:
+  kafka_data:
+  spark_ivy_cache:
+
+services:
+
+  # ------------------------------------------------------------------
+  # STORAGE LAYER — HDFS (data lake: raw data, streamed data, models)
+  # ------------------------------------------------------------------
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    hostname: namenode
+    environment:
+      - CLUSTER_NAME=bigdata-project
+    env_file:
+      - ./hadoop.env
+    ports:
+      - "9870:9870"   # NameNode web UI
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+      - ./data/raw:/data/raw   # host CSVs, mounted so we can `hdfs dfs -put` them in
+    networks:
+      - bigdata-net
+    mem_limit: 1.5g
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870/dfshealth.html"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    hostname: datanode
+    depends_on:
+      namenode:
+        condition: service_healthy
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870
+    env_file:
+      - ./hadoop.env
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    networks:
+      - bigdata-net
+    mem_limit: 1g
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9864/"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ------------------------------------------------------------------
+  # MESSAGE BROKER — Kafka in KRaft mode (no Zookeeper)
+  # ------------------------------------------------------------------
+  kafka:
+    # bitnami/kafka:3.7 stopped resolving after Bitnami's 2025 Docker Hub
+    # restructuring — most tags moved behind the bitnamilegacy/ namespace.
+    image: bitnamilegacy/kafka:3.7.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9093:9093"   # external listener, host-side debugging only
+    environment:
+      - KAFKA_CFG_NODE_ID=0
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9091
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9091,EXTERNAL://:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://localhost:9093
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    volumes:
+      - kafka_data:/bitnami/kafka
+    networks:
+      - bigdata-net
+    mem_limit: 1.2g
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ------------------------------------------------------------------
+  # SOURCE OF TRUTH — MySQL: model_registry (pointers/metrics) + predictions
+  # No model blobs live here — those go to HDFS.
+  # ------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    hostname: mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-changeme}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-model_registry}
+      - MYSQL_USER=${MYSQL_USER:-bigdata_user}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-changeme}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d   # auto-creates schema on first boot
+    networks:
+      - bigdata-net
+    mem_limit: 0.75g
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-changeme}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ------------------------------------------------------------------
+  # DATA PRODUCER — reads Nov data from HDFS, replays it into Kafka
+  # ------------------------------------------------------------------
+  ingestion-job:
+    build: ./ingestion-job
+    container_name: ingestion-job
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      - HDFS_WEBHDFS_URL=http://namenode:9870
+      - HDFS_USER=root
+      - HDFS_SOURCE_PATH=/data/raw/2019-11
+      - RAW_CSV_FILENAME=${INGESTION_CSV_FILENAME:-2019-Nov.csv}
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - KAFKA_TOPIC=${KAFKA_TOPIC:-clickstream-events}
+      - REPLAY_RATE_EVENTS_PER_SEC=${REPLAY_RATE_EVENTS_PER_SEC:-500}
+      # 0 = replay the entire file (can take hours — see sizing notes).
+      # Set to e.g. 50000 for a fast, bounded demo run.
+      - MAX_EVENTS=${MAX_EVENTS:-0}
+    networks:
+      - bigdata-net
+    mem_limit: 512m
+    cpus: 0.5
+    restart: on-failure
+
+  # ------------------------------------------------------------------
+  # PREDICTION ENGINE — PySpark Structured Streaming, local[*] mode
+  # Reads Champion model from HDFS, writes predictions to MySQL AND
+  # writes raw+scored events to HDFS as Parquet (data lake requirement)
+  # ------------------------------------------------------------------
+  streaming-job:
+    build: ./streaming-job
+    container_name: streaming-job
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      - HDFS_URI=hdfs://namenode:9000
+      - HDFS_STREAM_SINK_PATH=/data/streaming/2019-11
+      - HDFS_CHECKPOINT_PATH=/checkpoints/streaming-job
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - KAFKA_TOPIC=${KAFKA_TOPIC:-clickstream-events}
+      - MYSQL_HOST=mysql
+      - MYSQL_DB=${MYSQL_DATABASE:-model_registry}
+      - MYSQL_USER=${MYSQL_USER:-bigdata_user}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-changeme}
+      - MODEL_POLL_INTERVAL_SECONDS=${MODEL_POLL_INTERVAL_SECONDS:-30}
+      - PARQUET_TRIGGER_INTERVAL_SECONDS=${PARQUET_TRIGGER_INTERVAL_SECONDS:-60}
+      - SCORING_TRIGGER_INTERVAL_SECONDS=${SCORING_TRIGGER_INTERVAL_SECONDS:-30}
+      - SPARK_LOCAL_IP=127.0.0.1
+    volumes:
+      - spark_ivy_cache:/root/.ivy2
+    networks:
+      - bigdata-net
+    mem_limit: 2g
+    cpus: 1.5
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # BATCH MLOPS — trains on HDFS data, compares vs Champion, saves model
+  # to HDFS, updates MySQL registry (metadata only)
+  # ------------------------------------------------------------------
+  training-job:
+    build: ./training-job
+    container_name: training-job
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      - HDFS_URI=hdfs://namenode:9000
+      - HDFS_TRAIN_SOURCE_PATH=/data/raw/2019-10
+      - HDFS_STREAM_SINK_PATH=/data/streaming/2019-11
+      - HDFS_MODEL_BASE_PATH=/models
+      - MYSQL_HOST=mysql
+      - MYSQL_DB=${MYSQL_DATABASE:-model_registry}
+      - MYSQL_USER=${MYSQL_USER:-bigdata_user}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-changeme}
+      # Real cadence is monthly; shortened here so the retrain path is
+      # demoable. Set to 2592000 (30 days) for the "production" value.
+      - TRAINING_INTERVAL_SECONDS=${TRAINING_INTERVAL_SECONDS:-300}
+      - CHAMPION_IMPROVEMENT_THRESHOLD=${CHAMPION_IMPROVEMENT_THRESHOLD:-0.02}
+      - RUN_ONCE=${RUN_ONCE:-false}
+      - RAW_CSV_FILENAME=${RAW_CSV_FILENAME:-2019-Oct.csv}
+      - SPARK_LOCAL_IP=127.0.0.1
+    networks:
+      - bigdata-net
+    mem_limit: 4.5g
+    cpus: 2.0
+    restart: on-failure
+
+  # ------------------------------------------------------------------
+  # VISIBILITY — Django dashboard, reads MySQL only
+  # ------------------------------------------------------------------
+  django-dashboard:
+    build: ./django-dashboard
+    container_name: django-dashboard
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_DB=${MYSQL_DATABASE:-model_registry}
+      - MYSQL_USER=${MYSQL_USER:-bigdata_user}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-changeme}
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-True}
+    ports:
+      - "8000:8000"
+    networks:
+      - bigdata-net
+    mem_limit: 0.5g
+    cpus: 0.5
+    restart: unless-stopped

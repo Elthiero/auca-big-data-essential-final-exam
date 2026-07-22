@@ -1,0 +1,34 @@
+# Exclude raw and processed big data directories (stored in HDFS anyway)
+data/
+*.csv
+*.parquet
+
+# Exclude local database storage mounts
+mysql_data/
+hadoop_data/
+
+# Exclude Git files
+.git
+.gitignore
+
+# Exclude Python environment & cache files
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Exclude private environment configurations and secrets
+.env
+*.env
+!hadoop.env # Keep hadoop.env as it is required for service configs
+
+# Exclude IDE and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
