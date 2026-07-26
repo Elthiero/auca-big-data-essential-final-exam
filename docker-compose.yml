@@ -236,6 +236,8 @@ services:
       - HDFS_TRAIN_SOURCE_PATH=/data/raw/2019-10
       - HDFS_STREAM_SINK_PATH=/data/streaming/2019-11
       - HDFS_MODEL_BASE_PATH=/models
+      # logistic_regression | random_forest | gbt
+      - MODEL_TYPE=${MODEL_TYPE:-logistic_regression}
       - MYSQL_HOST=mysql
       - MYSQL_DB=${MYSQL_DATABASE:-model_registry}
       - MYSQL_USER=${MYSQL_USER:-bigdata_user}

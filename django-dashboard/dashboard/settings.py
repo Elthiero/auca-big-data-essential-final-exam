@@ -80,3 +80,8 @@ USE_TZ = True
 STATIC_URL = "static/"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# The monitor models are managed=False (see monitor/models.py). Django's
+# default runner therefore will not create them in the test database.
+# See dashboard/test_runner.py.
+TEST_RUNNER = "dashboard.test_runner.UnmanagedModelTestRunner"

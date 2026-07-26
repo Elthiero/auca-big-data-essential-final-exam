@@ -9,13 +9,20 @@ Two independent sinks read from the same Kafka topic:
      Champion model -> written to MySQL `predictions`.
 
 Why aggregation works the same way as training:
-  Structured Streaming's groupBy(...).agg(...) on a streaming DataFrame
-  maintains incremental state per key (user_session) and emits an
-  updated row every time a new event for that key arrives — this is
-  the SAME aggregation logic as train.py's build_session_features,
-  just incremental instead of computed over a finished session. Using
-  identical feature expressions here is what makes the trained
-  PipelineModel valid to apply to these rows.
+  Structured Streaming's groupBy(...).agg(...) maintains incremental
+  state per key (user_session) using the SAME feature expressions as
+  train.py's build_session_features — including its purchase-event
+  filter. Identical feature expressions on both sides are what make the
+  trained PipelineModel valid to apply to these rows.
+
+  Emission semantics: this query runs in Append mode over a
+  session_window, so each session produces exactly ONE scored row, once
+  the 30-minute watermark closes it — not a running update per event.
+  Append is required here because session windows merge as new events
+  arrive, and a merged window cannot be retracted from a downstream sink
+  that has already been written to. The trade-off is that scoring happens
+  at session close rather than mid-session; Update mode with a fixed
+  tumbling window would invert that trade-off.
 
 Why foreachBatch:
   MLlib's PipelineModel.transform() only works on a static (batch)
@@ -219,35 +226,40 @@ def write_predictions_partition(rows):
 
 def build_session_aggregates(parsed_df):
     """
-    Same aggregation logic as train.py's build_session_features —
-    now using session_window to ensure state eviction works correctly.
+    Mirror image of train.py's build_session_features, minus the label.
+
+    The grouping key (user_session + a 30-minute session_window) and the
+    conditional purchase-event exclusion on every feature are both required
+    to match train.py exactly. If either diverges, the PipelineModel is
+    applied to feature distributions it was never fit on and produces
+    confident, meaningless probabilities with nothing failing loudly.
+    tests/test_feature_parity.py exists to catch that drift.
+
+    Purchase events are excluded from FEATURES but still participate in
+    defining the window boundary, exactly as in training. They are also
+    still archived in full by sink 1, so retraining can derive labels.
     """
+    non_purchase = F.col("event_type") != "purchase"
+
     return (
         parsed_df.withWatermark("event_time", "30 minutes")
-        # Grouping by both user_session AND a session window on event_time
-        # enables true state eviction after 30 minutes of inactivity.
         .groupBy(
             "user_session",
             F.session_window("event_time", "30 minutes").alias("session"),
         )
         .agg(
-            F.min("event_time").alias("session_start"),
-            F.max("event_time").alias("session_end"),
-            F.sum(F.when(F.col("event_type") == "view", 1).otherwise(0)).alias(
-                "view_count"
-            ),
-            F.sum(F.when(F.col("event_type") == "cart", 1).otherwise(0)).alias(
-                "cart_count"
-            ),
-            F.sum(
-                F.when(F.col("event_type") == "remove_from_cart", 1).otherwise(0)
-            ).alias("remove_count"),
-            F.approx_count_distinct("product_id").alias("distinct_products"),
-            F.approx_count_distinct("category_id").alias("distinct_categories"),
-            F.approx_count_distinct("brand").alias("distinct_brands"),
-            F.avg("price").alias("avg_price"),
-            F.max("price").alias("max_price"),
+            F.min(F.when(non_purchase, F.col("event_time"))).alias("session_start"),
+            F.max(F.when(non_purchase, F.col("event_time"))).alias("session_end"),
+            F.sum(F.when(F.col("event_type") == "view", 1).otherwise(0)).alias("view_count"),
+            F.sum(F.when(F.col("event_type") == "cart", 1).otherwise(0)).alias("cart_count"),
+            F.sum(F.when(F.col("event_type") == "remove_from_cart", 1).otherwise(0)).alias("remove_count"),
+            F.approx_count_distinct(F.when(non_purchase, F.col("product_id"))).alias("distinct_products"),
+            F.approx_count_distinct(F.when(non_purchase, F.col("category_id"))).alias("distinct_categories"),
+            F.approx_count_distinct(F.when(non_purchase, F.col("brand"))).alias("distinct_brands"),
+            F.avg(F.when(non_purchase, F.col("price"))).alias("avg_price"),
+            F.max(F.when(non_purchase, F.col("price"))).alias("max_price"),
         )
+        .filter(F.col("session_start").isNotNull())
         .withColumn(
             "session_duration_sec",
             F.col("session_end").cast("long") - F.col("session_start").cast("long"),

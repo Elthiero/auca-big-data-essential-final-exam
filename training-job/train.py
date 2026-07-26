@@ -18,10 +18,11 @@ from pyspark.sql import functions as F
 from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.feature import VectorAssembler
 
-# Uncomment one of the following classifiers to swap in a different model type
-from pyspark.ml.classification import LogisticRegression
-# from pyspark.ml.classification import GBTClassifier
-# from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.classification import (
+    LogisticRegression,
+    RandomForestClassifier,
+    GBTClassifier,
+)
 
 from pyspark.ml.evaluation import (
     BinaryClassificationEvaluator,
@@ -46,6 +47,11 @@ CHAMPION_IMPROVEMENT_THRESHOLD = float(os.environ.get("CHAMPION_IMPROVEMENT_THRE
 # Set RUN_ONCE=true for the first manual training run (no infinite loop)
 RUN_ONCE = os.environ.get("RUN_ONCE", "false").lower() == "true"
 RAW_CSV_FILENAME = os.environ.get("RAW_CSV_FILENAME", "2019-Oct.csv")
+
+# Which MLlib classifier to train. Set in .env / docker-compose rather than
+# by editing this file, so the model actually in use is always visible in
+# configuration (and in the run logs) instead of buried in a code comment.
+MODEL_TYPE = os.environ.get("MODEL_TYPE", "logistic_regression").strip().lower()
 
 
 def get_spark():
@@ -124,7 +130,13 @@ def load_consolidated_datasets(spark):
         try:
             stream_df = spark.read.parquet(HDFS_STREAM_SINK_PATH)
             if stream_df.limit(1).count() > 0:  # Cheap emptiness check
-                stream_df = stream_df.select(*core_columns)
+                # Deduplicate: the Parquet archive is append-only, so replaying
+                # the producer or resetting Kafka offsets writes the same events
+                # a second time. Without this, each retrain cycle would train on
+                # an inflated, artificially reweighted copy of the same sessions.
+                # Only the streamed side needs it — the Oct baseline is read once
+                # from a single immutable CSV.
+                stream_df = stream_df.select(*core_columns).dropDuplicates(core_columns)
                 combined_df = baseline_df.unionByName(stream_df)
                 print("[train.py] Dataset consolidation successful! Training on combined records.")
                 return combined_df
@@ -136,21 +148,58 @@ def load_consolidated_datasets(spark):
 
 
 def build_session_features(df):
+    """
+    Builds one row per session window: pre-purchase behavioural features
+    plus the binary outcome label.
+
+    Two correctness constraints are enforced here, and both must hold
+    identically in streaming-job/consumer.py or live scores silently drift.
+
+    1. Leakage control. The label is derived from the full event list (did
+       this window ever contain a purchase?), but every FEATURE is computed
+       with purchase events excluded via conditional aggregation. Letting
+       the purchase event into feature aggregation would make purchasing
+       sessions mechanically longer, wider and differently priced — the
+       model would be reading the target off its own input.
+
+    2. Session boundaries. Grouping is by user_session AND a 30-minute
+       session_window, not by user_session alone. In this dataset a
+       user_session id can persist across long idle gaps, so grouping by id
+       alone would train on one large merged session while the streaming
+       job — which must use session_window for state eviction — scores two
+       or three smaller ones. Matching the windowing here is what keeps the
+       two feature distributions comparable.
+
+    Note this costs a sort per key rather than a flat hash aggregate. If
+    training memory becomes the binding constraint, the lever to pull is
+    spark.sql.shuffle.partitions, not this grouping.
+    """
+    non_purchase = F.col("event_type") != "purchase"
+
     session_agg = (
-        df.groupBy("user_session")
+        df.groupBy(
+            "user_session",
+            F.session_window("event_time", "30 minutes").alias("session"),
+        )
         .agg(
-            F.min("event_time").alias("session_start"),
-            F.max("event_time").alias("session_end"),
+            # Label: computed across ALL events in the window.
+            F.max(F.when(F.col("event_type") == "purchase", 1).otherwise(0)).alias("label"),
+            # Features: purchase events excluded from every one of them.
+            F.min(F.when(non_purchase, F.col("event_time"))).alias("session_start"),
+            F.max(F.when(non_purchase, F.col("event_time"))).alias("session_end"),
             F.sum(F.when(F.col("event_type") == "view", 1).otherwise(0)).alias("view_count"),
             F.sum(F.when(F.col("event_type") == "cart", 1).otherwise(0)).alias("cart_count"),
             F.sum(F.when(F.col("event_type") == "remove_from_cart", 1).otherwise(0)).alias("remove_count"),
-            F.max(F.when(F.col("event_type") == "purchase", 1).otherwise(0)).alias("label"),
-            F.approx_count_distinct("product_id").alias("distinct_products"),
-            F.approx_count_distinct("category_id").alias("distinct_categories"),
-            F.approx_count_distinct("brand").alias("distinct_brands"),
-            F.avg("price").alias("avg_price"),
-            F.max("price").alias("max_price"),
+            F.approx_count_distinct(F.when(non_purchase, F.col("product_id"))).alias("distinct_products"),
+            F.approx_count_distinct(F.when(non_purchase, F.col("category_id"))).alias("distinct_categories"),
+            F.approx_count_distinct(F.when(non_purchase, F.col("brand"))).alias("distinct_brands"),
+            F.avg(F.when(non_purchase, F.col("price"))).alias("avg_price"),
+            F.max(F.when(non_purchase, F.col("price"))).alias("max_price"),
         )
+        # A window containing only purchase events has no pre-purchase
+        # behaviour to learn from. Dropping it is deliberate: imputing zeros
+        # would teach the model that an empty session predicts a purchase.
+        .filter(F.col("session_start").isNotNull())
         .withColumn(
             "session_duration_sec",
             F.col("session_end").cast("long") - F.col("session_start").cast("long"),
@@ -198,13 +247,30 @@ FEATURE_COLS = [
 ]
 
 
+def build_classifier():
+    """
+    Selected by the MODEL_TYPE environment variable. All three support
+    weightCol in Spark 3.5, so the class-imbalance correction applies
+    identically whichever is chosen.
+    """
+    common = dict(featuresCol="features", labelCol="label", weightCol="class_weight")
+
+    if MODEL_TYPE == "random_forest":
+        return RandomForestClassifier(numTrees=100, maxDepth=10, seed=42, **common)
+    if MODEL_TYPE == "gbt":
+        return GBTClassifier(maxIter=50, maxDepth=5, seed=42, **common)
+    if MODEL_TYPE != "logistic_regression":
+        print(
+            f"[train.py] WARNING: unknown MODEL_TYPE='{MODEL_TYPE}', "
+            "falling back to logistic_regression."
+        )
+    return LogisticRegression(maxIter=50, **common)
+
+
 def build_pipeline():
     assembler = VectorAssembler(inputCols=FEATURE_COLS, outputCol="features", handleInvalid="skip")
-    
-    # Using Logistic Regression as the default stable baseline
-    classifier = LogisticRegression(
-        featuresCol="features", labelCol="label", weightCol="class_weight", maxIter=50
-    )
+    classifier = build_classifier()
+    print(f"[train.py] Classifier: {type(classifier).__name__} (MODEL_TYPE={MODEL_TYPE})")
     return Pipeline(stages=[assembler, classifier])
 
 
@@ -244,7 +310,8 @@ def find_best_threshold(model, val_df, thresholds=None):
 
 
 def evaluate(model, test_df):
-    predictions = model.transform(test_df)
+    predictions = model.transform(test_df).cache()
+    predictions.count()
 
     auc = BinaryClassificationEvaluator(labelCol="label", rawPredictionCol="rawPrediction", metricName="areaUnderROC").evaluate(predictions)
     accuracy = MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction", metricName="accuracy").evaluate(predictions)

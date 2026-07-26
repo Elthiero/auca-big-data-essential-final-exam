@@ -1,9 +1,11 @@
+import datetime
 import json
 
 from django.db.models import Avg, Count, Q
 from django.db.models.functions import TruncMinute
 from django.http import JsonResponse
 from django.shortcuts import render
+from django.utils import timezone
 
 from .models import ModelRegistry, Prediction, RunningMetric
 
@@ -28,16 +30,31 @@ def get_trend_data(limit_minutes=30):
     time-series trend of the live stream itself (volume + purchase
     rate over time) — distinct from the model-performance-over-training-
     runs chart, which trends training cycles, not live traffic.
+
+    Two things matter here:
+      1. The window is bounded by a scored_at cutoff, which hits the
+         idx_scored_at index. Without it, this GROUP BY scans the entire
+         predictions table on every 8-second poll — fine at 10k rows,
+         not fine at 10M.
+      2. Ordering is DESC before slicing, then reversed for display.
+         Slicing an ASC ordering returns the OLDEST n buckets, which
+         means the chart freezes on the first n minutes of the run and
+         never advances.
     """
+    cutoff = timezone.now() - datetime.timedelta(minutes=limit_minutes)
+
     buckets = (
-        Prediction.objects.annotate(minute=TruncMinute("scored_at"))
+        Prediction.objects.filter(scored_at__gte=cutoff)
+        .annotate(minute=TruncMinute("scored_at"))
         .values("minute")
         .annotate(
             total=Count("id"),
             purchases=Count("id", filter=Q(predicted_label=True)),
         )
-        .order_by("minute")[:limit_minutes]
+        .order_by("-minute")[:limit_minutes]
     )
+    buckets = sorted(buckets, key=lambda b: b["minute"] or datetime.datetime.min)
+
     return [
         {
             "minute": b["minute"].strftime("%m-%d %H:%M") if b["minute"] else "",
@@ -85,10 +102,19 @@ def index(request):
         (purchase_predicted / total_predictions * 100) if total_predictions else 0.0
     )
 
-    # Kept as is since Avg() is run infrequently on page-load,
-    # but could be cached if needed later
+    # Bounded to a recent window rather than the full table. An unbounded
+    # Avg() is a full scan of predictions; it is only run on page load
+    # rather than on every poll, but at multi-million row scale that is
+    # still a multi-second render. The recent-window average is also the
+    # more useful number operationally — it reflects what the currently
+    # active model is doing, not an average smeared across every model
+    # version ever promoted.
+    avg_window_start = timezone.now() - datetime.timedelta(minutes=30)
     avg_probability = (
-        Prediction.objects.aggregate(avg=Avg("purchase_probability"))["avg"] or 0.0
+        Prediction.objects.filter(scored_at__gte=avg_window_start).aggregate(
+            avg=Avg("purchase_probability")
+        )["avg"]
+        or 0.0
     )
 
     context = {
