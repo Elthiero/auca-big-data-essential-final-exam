@@ -1,279 +1,315 @@
-# eCommerce Purchase Prediction Pipeline (Big Data & MLOps Infrastructure)
+# eCommerce Purchase Prediction — Real-Time Big Data Pipeline
 
-This repository contains a production-grade, containerized MLOps and Big Data analytics pipeline designed to process real-time clickstream events, predict customer purchasing behavior, and continuously retrain models on a distributed data lake.
+**Big Data Essentials — Final Course Project**
+Master's in Big Data Analytics, Adventist University of Central Africa (AUCA)
+Instructor: Dr. Kundan Kumar
 
-The architecture seamlessly orchestrates distributed storage, high-throughput message streaming, stateful micro-batch aggregation, online machine learning inference, and an asynchronous operational web console.
+**Group members**
+
+| Name |
+|---|
+| Ahourdet Donambi Thierry |
+| Emmanuel Manzi |
+| Gwiza Rodrigue |
+| Niyindora Emile |
+| SHEMA Joshua |
 
 ---
 
-## System Architecture & Data Lifecycle
+## 1. What this project does
 
-The system operates using two distinct operational loops: a real-time predictive stream and an asynchronous batch-retraining lifecycle.
+Given a live clickstream of browsing events from an online store, the system predicts **whether a shopping session will end in a purchase** — while the session is still in flight — and surfaces those predictions on a live web dashboard.
+
+The pipeline is fully containerized and runs end to end with Docker Compose. It implements every component required by the course brief:
+
+| Required component | Implementation |
+|---|---|
+| HDFS | NameNode + DataNode cluster; raw CSVs, Parquet archives, model binaries, streaming checkpoints |
+| Kafka Producer (reading from HDFS) | `ingestion-job` streams rows out of HDFS over WebHDFS and publishes to Kafka |
+| Kafka Topic | `clickstream-events`, 3 partitions, keyed by `user_session` |
+| Kafka Consumer (PySpark Streaming) | `streaming-job`, Structured Streaming with session windows |
+| MLlib predictions | `training-job` fits a `PipelineModel`; the streaming job loads and applies it |
+| MySQL / AWS RDS | `model_registry`, `predictions`, `running_metrics` tables |
+| Django dashboard | Read-only live monitor at `http://localhost:8000` |
+
+**Case study:** customer behaviour prediction on the Kaggle *eCommerce Behavior Data from Multi-Category Store* dataset. October 2019 (~5.3 GB) is the historical training corpus loaded into HDFS; November 2019 (~9 GB) is replayed through Kafka to stand in for live traffic. Both files are well above the 1 GB minimum.
+
+---
+
+## 2. System architecture
 
 ![System Architecture](screenshots/architecture.png)
 
-### 1. Storage & Messaging Layer
+The system runs **two independent loops** over the same Kafka topic.
 
-* **HDFS (Data Lake Cluster):** Houses raw input datasets (exceeding 1GB), column-oriented Parquet historical archives, serialized model binaries, and stateful streaming checkpoint files.
-* **Apache Kafka (KRaft Mode):** Operates a zero-ZooKeeper message broker. The core streaming topic utilizes 3 distinct partitions to allow highly parallelized consumer access. Sessions are distributed via `user_session` hashing keys to ensure sequential execution for individual customer journeys.
+### Loop A — real-time scoring (seconds)
 
-### 2. Compute & ML Ingestion Layer
+```
+HDFS (2019-Nov.csv)
+   │  WebHDFS, line-by-line
+   ▼
+ingestion-job  ──►  Kafka topic: clickstream-events (3 partitions, key = user_session)
+                          │
+                          ▼
+                   streaming-job (PySpark Structured Streaming)
+                          ├── Sink 1: raw events ──► HDFS Parquet (partitioned by event_type, event_date)
+                          └── Sink 2: session aggregates ──► Champion model ──► MySQL predictions
+                                                                                      │
+                                                                                      ▼
+                                                                              Django dashboard
+```
 
-* **PySpark Structured Streaming Engine:** Consumes real-time JSON packets from Kafka. It tracks user sessions using an event-time `session_window` bounded by a 30-minute watermark. To comply with Spark’s dynamic window constraints, it processes streams in **Append Mode**, gracefully evicting inactive sessions from the state store to completely eliminate memory leaks.
-* **PySpark MLlib Batch Pipeline:** Trains a session-level binary classifier. The algorithm is selected by the `MODEL_TYPE` environment variable — `logistic_regression` (default), `random_forest` (100 trees), or `gbt` — so the model actually in use is visible in configuration and in the run logs rather than fixed in code. Class imbalance is corrected automatically: `add_class_weights()` computes the negative-to-positive ratio from the training split at runtime and passes it as `weightCol`, so the correction tracks the data rather than a hardcoded constant.
-* **Leakage control:** Session labels are derived from the full event list (did this window ever contain a purchase?), but every feature is aggregated with purchase events excluded. Including the purchase event in feature aggregation would make purchasing sessions mechanically longer, wider and differently priced, letting the model read the target off its own input.
-* **Train/serve feature parity:** Both services group by `user_session` **and** a 30-minute `session_window`, and derive each feature with identical expressions. Grouping by session id alone in training would not be equivalent: a `user_session` in this dataset can persist across long idle gaps, so training would learn from one merged session while the streaming job — which needs `session_window` for state eviction under Append mode — scores two or three smaller ones. `tests/test_feature_parity.py` compares the grouping keys and the parsed aggregation expressions of both files and fails if either drifts.
-* **Dynamic MLOps Orchestration:** Features a data-lake consolidator that uses a distributed `unionByName()` merge to aggregate historical training logs with the streaming Parquet lake. It re-scores the existing Champion against incoming Challengers using an apples-to-apples validation test matrix, executing zero-downtime memory model hot-swaps every 30 seconds.
+### Loop B — batch retraining (scheduled)
 
-### 3. Storage Sink & Analytical Dashboard
+```
+HDFS: /data/raw/2019-10 (baseline)  +  /data/streaming/2019-11 (accumulated by Sink 1)
+   │  unionByName + dropDuplicates
+   ▼
+training-job ──► session features ──► chronological split ──► MLlib pipeline
+                                                                   │
+                                    ┌──────────────────────────────┤
+                                    ▼                              ▼
+                       model artifact ──► HDFS /models/     metrics ──► MySQL model_registry
+                                                                            │
+                       streaming-job polls registry every 30 s ◄────────────┘
+                       and hot-swaps the model if is_active changed
+```
 
-* **Pre-Aggregated Summary Pattern:** Avoids `COUNT(*)` table scans for the headline figures. The Spark engine writes prediction rows and increments the `running_metrics` counter table inside a single transaction, so a dashboard poll reads two integers rather than counting millions of rows.
-* **Asynchronous Web Engine:** A read-only, dark-themed Django interface. Frontend JavaScript polls a `/api/stats/` JSON view every 8 seconds and updates **Chart.js** visuals in place, avoiding a full page reload. The counter reads are O(1) lookups against `running_metrics`; the per-minute trend chart is a `GROUP BY` bounded to a 30-minute window so it uses the `idx_scored_at` index instead of scanning the full `predictions` table on every poll.
+The registry is the coupling point between the two loops. It stores **pointers and metrics only** — never model blobs. Artifacts live in HDFS, which is what HDFS is for.
+
+### Storage split
+
+| Store | Contents |
+|---|---|
+| HDFS | Raw CSV, Parquet archives (historical + streamed), model artifacts, Spark checkpoints |
+| MySQL | Model registry rows, prediction rows, pre-aggregated counters |
 
 ---
 
-## Repository Structure
+## 3. Design decisions worth defending
+
+These are the four choices that most affect whether the numbers in Section 7 mean anything.
+
+### 3.1 Label leakage is excluded from features
+
+The label for a session is "did this window ever contain a `purchase` event?" — derived from the **full** event list. But every *feature* is aggregated with purchase events filtered out:
+
+```python
+non_purchase = F.col("event_type") != "purchase"
+F.avg(F.when(non_purchase, F.col("price"))).alias("avg_price")
+```
+
+Without this, purchasing sessions are mechanically longer, wider, and differently priced than non-purchasing ones, and the model reads its own target off its input. Scores look excellent and mean nothing.
+
+Windows containing *only* purchase events are dropped rather than zero-imputed — imputing zeros would teach the model that an empty session predicts a purchase.
+
+### 3.2 Train/serve feature parity is enforced by a test
+
+Both `train.py` and `consumer.py` group by `user_session` **and** a 30-minute `session_window`, and derive each feature with identical expressions. Grouping by session id alone would not be equivalent: a `user_session` in this dataset persists across long idle gaps, so training would learn from one merged session while the streaming job — which needs `session_window` for state eviction under Append mode — scores two or three smaller ones.
+
+This is the pipeline's most dangerous failure mode because it is silent. A *missing* column raises at runtime; a **reordered** column list, a **changed grouping key**, and a **changed aggregation expression** all fail quietly, producing confident nonsense with no error anywhere.
+
+`tests/test_feature_parity.py` parses both source files with `ast` and compares grouping keys and per-alias aggregation expressions structurally. It was mutation-checked: reordering `FEATURE_COLS`, swapping the session-window grouping for a plain `groupBy("user_session")`, and dropping the purchase exclusion from a single price aggregate each produce a failure.
+
+### 3.3 The split is chronological, not random
+
+60% train / 15% validation / 25% test by `session_start`. A random split would let the model learn from sessions occurring *after* the ones it is evaluated on, which corresponds to no real deployment.
+
+### 3.4 Class imbalance is corrected at runtime, not hardcoded
+
+`add_class_weights()` computes the negative-to-positive ratio from the training split each cycle and passes it as `weightCol`, so the correction tracks the data as the data grows. On the October baseline this came out at **13.57**.
+
+---
+
+## 4. Repository structure
 
 ```text
-├── data/
-│   └── raw/
-│       ├── 2019-10/
-│       │   └── 2019-Oct.csv                 # Raw historical dataset (>= 1GB training split)
-│       └── 2019-11/
-│           └── 2019-Nov.csv                 # Raw deployment dataset (>= 1GB streaming simulation)
-├── django-dashboard/                        # Operational UI and Admin Console
-│   ├── dashboard/                           # Django core settings configuration
+├── data/raw/                                # not in git — see setup step 2
+│   ├── 2019-10/2019-Oct.csv                 # historical training corpus
+│   └── 2019-11/2019-Nov.csv                 # replayed as the live stream
+├── django-dashboard/
+│   ├── dashboard/
 │   │   ├── settings.py
-│   │   ├── test_runner.py                   # Creates unmanaged tables in the test DB
-│   │   └── urls.py
-│   ├── monitor/                             # Analytical monitoring web application
-│   │   ├── templates/monitor/index.html     # Real-time Chart.js dark-theme frontend
-│   │   ├── models.py                        # Unmanaged mappings to streaming tables
-│   │   ├── tests.py                         # Dashboard view and aggregation tests
-│   │   └── views.py                         # Pre-aggregated polling endpoints
-│   ├── Dockerfile
-│   ├── manage.py
-│   ├── requirements.txt
-│   └── test_settings.py                     # SQLite overlay for running tests offline
-├── ingestion-job/                           # High-speed data ingestion pipeline
-│   ├── producer.py                          # WebHDFS stream-to-Kafka row relay script
-│   ├── Dockerfile
-│   └── requirements.txt
-├── mysql-init/
-│   └── init.sql                             # Database tables initialization schema
-├── screenshots/                             # Evidence captures referenced throughout
-│   ├── architecture.png                     # Formatted system workflow visual artifact
-│   └── system_architecture.png              # Multi-tier cluster overview screenshot
+│   │   ├── test_runner.py                   # creates unmanaged tables in the test DB
+│   │   ├── urls.py
+│   │   ├── asgi.py  wsgi.py
+│   ├── monitor/
+│   │   ├── templates/monitor/index.html     # Chart.js frontend, 8-second polling
+│   │   ├── models.py                        # unmanaged mappings to the streaming tables
+│   │   ├── views.py                         # index + /api/stats/ polling endpoint
+│   │   ├── tests.py                         # view and aggregation tests
+│   │   ├── admin.py  apps.py
+│   ├── test_settings.py                     # SQLite overlay for offline test runs
+│   ├── Dockerfile  manage.py  requirements.txt
+├── ingestion-job/
+│   ├── producer.py                          # WebHDFS → Kafka row relay
+│   ├── Dockerfile  requirements.txt
+├── mysql-init/init.sql                      # schema, auto-applied on first MySQL boot
+├── screenshots/                             # evidence captures referenced below
 ├── scripts/
-│   ├── create_kafka_topic.sh                # Stream topic partition mapping initialization
-│   ├── clean_checkpoints.sh                 # Cleaning local Spark streaming checkpoints
-│   ├── load_to_hdfs.sh                      # HDFS data lake bootstrapper utility
-│   └── reset_and_run.sh                     # Full teardown + cold rerun, one command
-├── tests/
-│   └── test_feature_parity.py               # Train/stream feature contract tests
-├── streaming-job/                           # Live stream scoring runtime
-│   ├── consumer.py                          # Stateful PySpark Structured Streaming script
-│   ├── Dockerfile
-│   └── requirements.txt
-├── training-job/                            # Automated batch model retraining module
-│   ├── train.py                             # Polymorphic Champion/Challenger trainer script
-│   ├── Dockerfile
-│   └── requirements.txt
-├── .env.example                             # Pipeline infrastructure environment setup template
-├── .gitignore                               # Local compilation exclusions registry
-├── README.md                                # Architectural overview document
-├── docker-compose.yml                       # Distributed container runtime orchestrator
-└── hadoop.env                               # Ecosystem cluster filesystem environmental variables
-
+│   ├── create_kafka_topic.sh                # creates the topic with 3 partitions
+│   ├── load_to_hdfs.sh                      # pushes the raw CSVs into HDFS
+│   └── clean_checkpoints.sh                 # clears Spark streaming checkpoints
+├── streaming-job/
+│   ├── consumer.py                          # Structured Streaming, two sinks
+│   ├── Dockerfile  requirements.txt
+├── tests/test_feature_parity.py             # cross-service feature contract test
+├── training-job/
+│   ├── train.py                             # Champion/Challenger trainer
+│   ├── Dockerfile  requirements.txt
+├── .env.example  .gitignore  .dockerignore
+├── docker-compose.yml
+├── hadoop.env
+└── README.md
 ```
 
 ---
 
-## Quick Start
+## 5. Deployment guide
 
-Ensure your development environment contains Docker, Docker Compose, and a minimum of 8GB of free system RAM, then place the two Kaggle CSVs as described in step 1 below.
+Requires Docker, Docker Compose v2, and at least **8 GB of free RAM**. The training container alone is allocated 4.5 GB.
 
-To tear down everything and run the whole pipeline cold in one command:
-
-```bash
-./scripts/reset_and_run.sh
-```
-
-It runs the test suites, verifies the working tree, removes all Docker volumes, rebuilds the images, brings each layer up in dependency order waiting on healthchecks, blocks until a Champion is registered, then starts ingestion and the dashboard. Source CSVs under `./data/raw` are never touched. Add `--yes` to skip the confirmation prompt, `--skip-tests` to go straight to the rebuild, or `--no-cache` to force a clean image build.
-
-The remainder of this section walks the same sequence manually.
-
----
-
-## Step-by-Step Deployment Guide
-
-### 1. Initialize Configuration and Database Schema
-
-1. **Clone the Repository**: Download the source code to your local machine by cloning the project repository.
-
-   ```bash
-   git clone https://github.com/Elthiero/auca-big-data-essential-final-exam.git
-   cd auca-big-data-essential-final-exam
-   ```
-
-   *(Alternatively, you can manually download the [Project Source Code ZIP File](https://github.com/Elthiero/auca-big-data-essential-final-exam.git) and extract it.)*
-
-2. Download the dataset files (`2019-Oct.csv` and `2019-Nov.csv`) directly from the [Kaggle eCommerce Behavior Data Dataset](https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store).
-3. Unzip the downloaded archive.
-4. Move and organize the unzipped `.csv` files into the project structure shown below:
-
-    ```text
-    ├── data/
-    │   └── raw/
-    │       ├── 2019-10/
-    │       │   └── 2019-Oct.csv                 
-    │       └── 2019-11/
-    │           └── 2019-Nov.csv  
-    ```
-
-Generate your environment runtime profile and spin up your metadata storage block:
+### Step 1 — Clone and configure
 
 ```bash
+git clone https://github.com/Elthiero/auca-big-data-essential-final-exam.git
+cd auca-big-data-essential-final-exam
 cp .env.example .env
-docker compose up mysql -d
 ```
 
-*you can modify the .env file.*
+Edit `.env` if you want non-default credentials, a different classifier, or a different replay rate. Note that `.env` takes precedence over the defaults baked into `docker-compose.yml`.
 
-Verify that the unmanaged core tables (`model_registry`, `predictions`, and `running_metrics`) have initialized perfectly:
+### Step 2 — Place the dataset
+
+Download `2019-Oct.csv` and `2019-Nov.csv` from the [Kaggle eCommerce Behavior Data dataset](https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store), unzip, and arrange them as:
+
+```text
+data/raw/2019-10/2019-Oct.csv
+data/raw/2019-11/2019-Nov.csv
+```
+
+### Step 3 — Start MySQL and verify the schema
 
 ```bash
+docker compose up mysql -d
+
 docker exec -it mysql mysql -u bigdata_user -p"$MYSQL_PASSWORD" \
   -e "USE model_registry; SHOW TABLES; SELECT * FROM running_metrics;"
 ```
 
-*use the database user and password from your .env, if you are using AWS RDS or any other database you can check mysql-init/init.sql to get the sql queries.*
+You should see `model_registry`, `predictions`, and `running_metrics`, with both counters at 0. If you are using AWS RDS instead, run `mysql-init/init.sql` against your endpoint manually — the auto-init only fires for the local container.
 
-![Mysql Local](screenshots/mysql.png)
+![MySQL schema](screenshots/mysql.png)
 
-### 2. Bootstrap the HDFS Data Lake
-
-Launch the distributed storage nodes:
+### Step 4 — Bootstrap the HDFS data lake
 
 ```bash
 docker compose up namenode datanode -d
-docker compose ps          # wait until both say healthy
-```
-
-Access the NameNode web UI at `http://localhost:9870` to verify node health. Execute the bootstrapper script to automatically push your raw datasets into HDFS blocks:
-
-```bash
+docker compose ps          # wait until both report healthy
 ./scripts/load_to_hdfs.sh
 ```
 
-![Hadoop Logs](screenshots/hdfs_details.png)
+The NameNode web UI is at `http://localhost:9870`.
+
+![HDFS cluster detail](screenshots/hdfs_details.png)
 
 The raw CSVs are now split into HDFS blocks across the DataNode:
 
 ![HDFS raw data](screenshots/hdfs_raw.png)
-![HDFS raw data block detail](screenshots/hdfs_raw2.png)
+![HDFS block detail](screenshots/hdfs_raw2.png)
 
-### 3. Spin Up Message Ingestion Network
-
-Boot the self-managed Kafka communication node:
+### Step 5 — Start Kafka and create the topic
 
 ```bash
 docker compose up kafka -d
 docker compose ps          # wait for healthy
-```
-
-Initialize your event topic with 3 partitions to guarantee parallel streaming channels:
-
-```bash
 ./scripts/create_kafka_topic.sh
 ```
 
-![Kafka logs](screenshots/kafka.png)
+Kafka runs in **KRaft mode** — no ZooKeeper. The topic is created with 3 partitions so consumers can parallelize; messages are keyed by `user_session` so all events for one session land on one partition and stay ordered.
 
-### 4. Execute the Initial Training Pass
+![Kafka topic](screenshots/kafka.png)
 
-Choose your classifier in `.env` if you want something other than the default (`logistic_regression` | `random_forest` | `gbt`):
+### Step 6 — Train the first model
+
+Pick a classifier in `.env` if you want something other than the default:
 
 ```ini
-MODEL_TYPE=logistic_regression
+MODEL_TYPE=logistic_regression    # or random_forest | gbt
 ```
-
-Kick off the batch machine learning process to establish your initial base model:
 
 ```bash
 docker compose up training-job -d
-```
-
-To observe features being calculated, threshold sweeps executing, and weights generating, watch the logs:
-
-```bash
 docker logs -f training-job
 ```
 
-To check model info from mysql, you can run:
+Expect roughly **20 minutes** for a full cycle on the October corpus inside the 4.5 GB container. You will see the Parquet conversion, session aggregation counts, the class weight ratio, the threshold sweep, and finally the Champion promotion.
+
+![Training log](screenshots/training_log.png)
+
+Confirm the registry row:
 
 ```bash
 docker exec -it mysql mysql -u bigdata_user -p"$MYSQL_PASSWORD" \
   -e "SELECT version, auc_score, decision_threshold, is_active FROM model_registry.model_registry;"
 ```
 
-*Upon completion, the system saves your model directly inside HDFS at `/models/candidates/` and crowns it as `Champion v1` in the database.*
+The model artifact itself is written to HDFS at `/models/candidates/<version>`.
 
-![Training Model](screenshots/training_log.png)
+### Step 7 — Start ingestion, scoring, and the dashboard
 
-### 5. Launch Ingestion, Real-Time Inference, and the UI
-
-Now that an active model is registered, ignite your live ingestion stream, PySpark consumer, and web dashboard simultaneously:
+Only do this **after** a Champion exists — the streaming job will start, but it skips scoring and logs `no Champion loaded yet` until one is registered.
 
 ```bash
 docker compose up streaming-job ingestion-job django-dashboard -d
-```
-
-Verify the real-time processing metrics using your container log tail:
-
-```bash
 docker logs -f streaming-job
 ```
 
-Sink 1 of the streaming job simultaneously archives every incoming event to the Parquet data lake, partitioned by `event_type` and `event_date` — this is what the next retraining cycle consolidates with the October baseline:
+![Producer and consumer logs](screenshots/logs.png)
 
-![HDFS streamed Parquet](screenshots/hdfs_stream_data.png)
+Sink 1 archives every incoming event to the Parquet data lake, partitioned by `event_type` and `event_date`. This is what the next retraining cycle consolidates with the October baseline:
 
-Open your web browser and navigate to `http://localhost:8000` to interact with your live operations monitoring engine.
+![Streamed Parquet in HDFS](screenshots/hdfs_stream_data.png)
 
-![Producer & Consumer](screenshots/logs.png)
+Open `http://localhost:8000`:
 
 ![Dashboard](screenshots/dashboard.png)
 
+The dashboard is a read-only white/blue interface. Frontend JavaScript polls `/api/stats/` every 8 seconds and updates Chart.js visuals in place, without a full page reload.
+
+### Timing note
+
+At the default 500 events/sec, replaying the whole November file takes many hours. For a bounded demo, set `MAX_EVENTS=50000` in `.env`. Sessions are only emitted once their 30-minute watermark closes, so allow a few minutes of event time before predictions appear.
+
 ---
 
-## Technologies and Version Information
+## 6. Technologies and versions
 
 | Layer | Technology | Version | Notes |
 |---|---|---|---|
 | Distributed storage | Apache Hadoop / HDFS | 3.2.1 | `bde2020/hadoop-*:2.0.0-hadoop3.2.1-java8`, replication factor 1, WebHDFS enabled |
-| Message broker | Apache Kafka | 3.7.0 | `bitnamilegacy/kafka:3.7.0`, KRaft mode (no ZooKeeper), 3 partitions |
-| Processing / ML | Apache Spark (PySpark) | 3.5.1 | `local[*]` mode inside each job container |
-| Scala runtime | Scala | 2.12 | Determines the Kafka connector artifact suffix below |
+| Message broker | Apache Kafka | 3.7.0 | `bitnamilegacy/kafka:3.7.0`, KRaft mode, 3 partitions |
+| Processing engine | Apache Spark (PySpark) | 3.5.1 | `local[*]` inside each job container |
+| Scala runtime | Scala | 2.12 | Determines the Kafka connector artifact suffix |
 | ML library | Spark MLlib | 3.5.1 | Ships with PySpark; no separate install |
-| Database | MySQL | 8.0 | Local container, or AWS RDS MySQL — see migration section |
-| Web framework | Django | 5.0.6 | Development server; read-only dashboard |
-| Charting | Chart.js | 4.x (CDN) | Loaded client-side |
+| Database | MySQL | 8.0 | Local container, or AWS RDS MySQL |
+| Web framework | Django | 5.0.6 | Development server, read-only dashboard |
+| Charting | Chart.js | 4.4.1 | CDN, client-side |
 | Language runtime | Python | 3.10 | `python:3.10-slim` base for all four job images |
-| Java runtime | OpenJDK JRE (headless) | 17 | `default-jre-headless`, Spark/JVM side only |
-| Orchestration | Docker Compose | v2 | Single-host, six services |
+| Java runtime | OpenJDK JRE headless | 17 | `default-jre-headless`, JVM side only |
+| Orchestration | Docker Compose | v2 | Single host, six services |
 
-### Dependencies
+### JAR dependency
 
-**Spark JAR resolved at runtime** (declared in `streaming-job/consumer.py` via `spark.jars.packages`, downloaded on first run and cached in the `spark_ivy_cache` volume):
+Resolved at runtime via `spark.jars.packages` in `streaming-job/consumer.py`, downloaded on first run and cached in the `spark_ivy_cache` volume:
 
 ```text
 org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
 ```
 
-The `_2.12` suffix must match the Scala version Spark was built against, and the trailing `3.5.1` must match the PySpark version in `requirements.txt`. A mismatch in either produces a `ClassNotFoundException` for the Kafka source at query start rather than at import time, which makes it easy to misdiagnose.
+The `_2.12` suffix must match the Scala version Spark was built against, and `3.5.1` must match the PySpark version in `requirements.txt`. A mismatch in either produces a `ClassNotFoundException` for the Kafka source at *query start* rather than at import time, which makes it easy to misdiagnose.
 
-**Python packages by service:**
+### Python dependencies by service
 
 | Service | Packages |
 |---|---|
@@ -282,86 +318,142 @@ The `_2.12` suffix must match the Scala version Spark was built against, and the
 | `training-job` | `pyspark==3.5.1`, `pymysql==1.1.0`, `cryptography==42.0.8`, `numpy==1.26.4`, `pandas==2.1.1` |
 | `django-dashboard` | `Django==5.0.6`, `PyMySQL==1.1.0`, `cryptography==42.0.8` |
 
-Two deliberate substitutions: `confluent-kafka` over `kafka-python`, because delivery failures surface through its callback instead of being retried silently in a background thread; and `PyMySQL` over `mysqlclient`, because it is pure Python and avoids adding `libmysqlclient-dev` plus a C toolchain to the images.
+Two deliberate substitutions:
+
+- **`confluent-kafka` over `kafka-python`** — delivery failures surface through its callback instead of being retried silently on a background thread. The original implementation hung at roughly 80,000 events with no error output; the callback plus periodic `flush()` fixed it.
+- **`PyMySQL` over `mysqlclient`** — pure Python, avoiding `libmysqlclient-dev` and a C toolchain in every image.
 
 ---
 
-## Testing
+## 7. Results
 
-```bash
-# Cross-service contract tests — no pyspark, JVM, HDFS or MySQL required
-python -m pytest tests/ -v
+All figures below come from the training cycle `20260726_083630`, logistic regression on the October 2019 corpus. This was the cold-start run, so `training-job` reported *"Training baseline configuration activated. Using static data lake records only"* — no streamed November data had accumulated yet, and the model was promoted directly as Champion v1 with no Challenger comparison.
 
-# Dashboard tests (SQLite, no running MySQL required)
-cd django-dashboard && python manage.py test monitor --settings=test_settings
-```
+### 7.1 Dataset after session aggregation
 
-`tests/test_feature_parity.py` guards the pipeline's most dangerous failure mode, which is silent. `streaming-job` loads a `PipelineModel` that `training-job` fit against a specific *ordered* feature list, produced by specific aggregation expressions over a specific grouping key. Of the three ways those can drift, only one announces itself: a **missing** column raises at runtime, but a **reordered** column list, a **changed grouping key**, and a **changed aggregation expression** all fail silently — Spark scores every session against a distribution the model never saw and returns confident nonsense with no error anywhere.
+| Quantity | Value |
+|---|---|
+| Sessions (October, after windowing) | 9,436,444 |
+| Sessions ending in a purchase | 630,085 |
+| Purchase rate | 6.7% |
+| Training split — negative | 5,291,223 |
+| Training split — positive | 389,875 |
+| Class weight ratio (neg/pos) | 13.57 |
 
-The tests parse both source files with `ast` and compare the grouping keys and the per-alias aggregation expressions structurally. They were mutation-checked: reordering `FEATURE_COLS`, replacing the session-window grouping with a plain `groupBy("user_session")`, and dropping the purchase exclusion from a single price aggregate each produce a failure.
+### 7.2 Threshold sweep on the validation set
 
-The dashboard tests cover the empty-database path (the frontend polls `/api/stats/` from page load, before any prediction exists), the pre-aggregated counter reads, and the trend window.
+| Threshold | Precision | Recall | F1 |
+|---|---|---|---|
+| 0.30 | 0.080 | 0.952 | 0.148 |
+| 0.40 | 0.237 | 0.741 | 0.359 |
+| 0.50 | 0.325 | 0.635 | 0.430 |
+| 0.60 | 0.381 | 0.596 | 0.465 |
+| 0.70 | 0.422 | 0.574 | 0.487 |
+| 0.80 | 0.453 | 0.560 | 0.501 |
+| **0.85** | **0.465** | **0.551** | **0.504** |
+| 0.90 | 0.481 | 0.517 | 0.498 |
+| 0.95 | 0.451 | 0.156 | 0.232 |
 
----
+Selected threshold: **0.85**, validation F1 = 0.504.
 
-## Core Performance Metrics
-
-> **Regenerate before submitting.** The figures below must come from your own run. Earlier numbers in this README predated the leakage fix described above and are not comparable — features were being aggregated over purchase events, which inflated every score. Run `docker compose up training-job -d && docker logs -f training-job` and copy the reported values in.
-
-### Batch training (`training-job`)
+### 7.3 Held-out test metrics
 
 | Metric | Value |
 |---|---|
-| Classifier (`MODEL_TYPE`) | _fill in_ |
-| Sessions after aggregation | _fill in_ |
-| Purchase rate (positive class) | _fill in_ |
-| Class weight ratio (neg/pos, computed at runtime) | _fill in_ |
-| Best decision threshold (validation $F_1$) | _fill in_ |
-| Test AUC | _fill in_ |
-| Test accuracy | _fill in_ |
-| Precision / recall on the purchase class | _fill in_ |
+| AUC (ROC) | 0.8280 |
+| Accuracy | 0.9333 |
+| Weighted precision | 0.9323 |
+| Weighted recall | 0.9333 |
+| Precision, purchase class | 0.4788 |
+| Recall, purchase class | 0.4621 |
+| Decision threshold | 0.85 |
 
-Note that accuracy is close to meaningless on this problem — a model that predicts "no purchase" for every session scores well above 90% — which is why promotion decisions in `train.py` are made on AUC and why `precision_purchase` / `recall_purchase` are tracked separately from their weighted counterparts.
-
-Split strategy is chronological, not random: 60% train / 15% validation / 25% test by `session_start`. A random split would let the model learn from sessions that occur *after* the ones it is evaluated on, which does not correspond to any real deployment.
-
-### Stream scoring (`streaming-job`)
-
-* **Intake rate-limiting:** `maxOffsetsPerTrigger=30000` caps how much backlog a single trigger absorbs, keeping micro-batch memory bounded when the consumer starts from `earliest` against an already-full topic.
-* **Write batching:** Prediction rows are inserted with `executemany` in chunks of 5,000 inside one transaction per partition, which also increments the `running_metrics` counters atomically.
-* **Emission semantics:** Append mode over a `session_window` emits one scored row per session, once the 30-minute watermark closes it. Sessions still open when the producer stops will not be emitted.
-
-### Findings
-
-> Fill this in from your own run — this is the section the rubric asks for, and it is the one graders read for evidence of thinking rather than plumbing. State conclusions about the *business problem*, not the infrastructure. Prompts to answer from your dashboard and training logs:
-
-* Which features carry the most signal? For logistic regression, inspect `model.stages[-1].coefficients` against `FEATURE_COLS`; for the tree models, `featureImportances`. The expectation is that `has_cart` and `cart_count` dominate — quantify by how much.
-* What is the operating trade-off at your chosen threshold? At threshold *t* you catch X% of real purchasers while Y% of flagged sessions never convert. Translate that into a decision: at what precision does it become worth triggering a discount offer or a retargeting email?
-* How does purchase rate vary across the live stream? The per-minute trend chart shows this directly.
-* Did the Challenger beat the Champion after retraining on Oct+Nov, and by how much AUC? If it did not clear the 0.02 promotion threshold, that is a legitimate finding — it says the October model already generalized to November — not a failure.
-* What are the limits? Single-node HDFS with replication 1, one Kafka broker, Spark in `local[*]`, and a replayed historical file standing in for genuine real-time traffic. Naming these is a stronger finish than claiming production readiness.
+Registered in MySQL as version `20260726_083630`, `auc_score = 0.828021`, `is_active = 1`.
 
 ---
 
-## Multi-Tier Cluster Overview
+## 8. Findings
 
-![Cluster overview](screenshots/system_architecture.png)
+**Accuracy is the wrong metric on this problem, and the numbers show exactly why.** The test accuracy of 93.33% is almost identical to what a model that predicts "no purchase" for every single session would score, given a ~6.7% purchase rate. A trivial constant predictor achieves essentially the same headline number. This is why `train.py` makes promotion decisions on AUC and tracks `precision_purchase` and `recall_purchase` separately from their weighted counterparts — the weighted figures (0.932, 0.933) are dominated by the majority class and carry almost no information about whether the model can find buyers.
+
+**The model has real signal.** AUC of 0.828 means that given one purchasing and one non-purchasing session at random, the model ranks the purchaser higher about 83% of the time. On the purchase class it recovers 46.2% of actual buyers at 47.9% precision. Against a 6.7% base rate, flagging a session lifts the probability that it converts from roughly 1 in 15 to roughly 1 in 2 — a **7-fold lift**. That is the number that matters commercially, and it is the one the accuracy figure completely hides.
+
+**The optimal threshold is 0.85, not 0.5, and that is a consequence of the class weighting.** Weighting positives by 13.57 inflates predicted probabilities across the board, so the natural 0.5 cut is far too permissive: at 0.5 the model achieves recall of 0.635 but precision of only 0.325. The sweep shows the trade-off is smooth and shallow between 0.70 and 0.90 — F1 moves only from 0.487 to 0.498 across that whole range — which means the operating point can be chosen on business grounds rather than statistical ones without much cost.
+
+**That choice is genuinely open.** At threshold 0.90 precision rises to 0.481 while recall falls to 0.517; at 0.70 precision drops to 0.422 while recall rises to 0.574. If the intervention is cheap — a banner, a free-shipping nudge — the lower threshold is right, because a wasted impression costs nothing and missed buyers cost margin. If the intervention is expensive — a percentage discount applied to the cart — the higher threshold is right, because every false positive is money handed to someone who was going to buy anyway. Below 0.35 the model collapses into flagging nearly everything: at threshold 0.30 recall is 95.2% but precision is 8.0%, barely above the base rate, which is operationally worthless.
+
+**The steep cliff between 0.30 and 0.35 is informative.** Precision jumps from 0.080 to 0.173 while recall only falls from 0.952 to 0.836. That discontinuity suggests a large, tightly clustered mass of low-intent sessions — almost certainly single-view bounces — that the model separates cleanly from everything else. The expensive discrimination problem is not "browser vs buyer," it is distinguishing serious browsers from buyers, which is where the remaining error lives.
+
+**Retraining has not yet been demonstrated end to end.** This cycle ran before any November data had accumulated in the Parquet lake, so it promoted unopposed as Champion v1. The Challenger path — consolidating October with streamed November data via `unionByName`, re-scoring the existing Champion on the same held-out test set, and promoting only on an AUC gain above 0.02 — is implemented and exercised by the code, but the comparative result is not in this report. Whether the Challenger clears the bar is an open question, and a *failure* to clear it would be a legitimate finding rather than a defect: it would say the October model already generalizes to November traffic.
+
+### Limitations
+
+Stating these plainly is more defensible than claiming production readiness.
+
+- **Single-node everything.** HDFS runs with replication factor 1 on one DataNode, Kafka is a single broker, and Spark runs `local[*]` rather than against a cluster manager. The architecture is distributed; the deployment is not. Nothing here demonstrates behaviour under node failure.
+- **Replayed history is not live traffic.** November 2019 events pushed at a fixed rate have no diurnal pattern, no bursts, no late-arriving or out-of-order records beyond what the file already contains, and no schema drift. A real stream has all four.
+- **Session scoring happens at close, not mid-session.** Append mode over a `session_window` emits one row per session once the 30-minute watermark expires. That is correct for evaluation but limits real-time intervention — by the time a session is scored, the user has been idle for half an hour. Update mode over a fixed tumbling window would invert this trade-off, at the cost of emitting repeated partial predictions per session.
+- **Feature set is deliberately shallow.** Ten aggregate behavioural features, no product embeddings, no user history across sessions, no category-level or temporal features. Cross-session user history in particular is available in the data and is the obvious next lever.
+- **Memory pressure during training.** The log shows Spark spilling cached RDD blocks to disk under the 4.5 GB container limit. Results are unaffected but the cycle is slower than it needs to be.
+- **`approx_count_distinct`** is used for the three cardinality features, trading a small amount of accuracy for tractable memory. Consistent between train and serve, so it does not cause skew.
 
 ---
 
-## Cloud Strategy: AWS RDS Migration
+## 9. Testing
 
-Follow this production blueprint to shift your data tier to an AWS cloud-managed system:
+```bash
+# Cross-service contract tests — no PySpark, JVM, HDFS or MySQL required
+python -m pytest tests/ -v
 
-1. **Deploy Instance:** Launch an AWS RDS instance using the engine type **MySQL Community Edition** under the AWS Free Tier. Set the inbound VPC Security Group Rules to accept active TCP traffic on port `3306` from your host gateway IP.
-2. **Import Schema:** Connect your database administration workspace (e.g., DBeaver or MySQL Workbench) to your AWS RDS Endpoint and run the initialization script located in `mysql-init/init.sql`.
-3. **Re-route Credentials:** Open your project `.env` file and replace local variables with your cloud database instance location coordinates:
+# Dashboard tests — SQLite, no running MySQL required
+cd django-dashboard && python manage.py test monitor --settings=test_settings
+```
+
+`tests/test_feature_parity.py` guards the silent-drift failure mode described in Section 3.2. The dashboard tests cover the empty-database path (the frontend polls `/api/stats/` from page load, before any prediction exists), the pre-aggregated counter reads, and the trend window bounds.
+
+Both suites run offline. `dashboard/test_runner.py` creates the unmanaged tables in the test database, since Django does not manage them.
+
+---
+
+## 10. Performance engineering
+
+A few choices that keep the system responsive at scale rather than only at demo size.
+
+**Pre-aggregated counters.** The dashboard's headline figures would otherwise require `COUNT(*)` over the `predictions` table on every 8-second poll. Instead, `write_predictions_partition` increments the `running_metrics` counter table inside the same transaction as the insert, so a poll reads two integers rather than counting millions of rows.
+
+**Bounded trend query.** The per-minute trend chart is a `GROUP BY` restricted to a 30-minute `scored_at` window, which uses the `idx_scored_at` index instead of scanning the full table. It also orders descending before slicing — slicing an ascending ordering returns the *oldest* buckets, which freezes the chart on the first minutes of the run.
+
+**Intake rate limiting.** `maxOffsetsPerTrigger=30000` caps how much backlog a single trigger absorbs, keeping micro-batch memory bounded when the consumer starts from `earliest` against an already-full topic.
+
+**Batched writes.** Prediction rows are inserted with `executemany` in chunks of 5,000 inside one transaction per partition.
+
+**Parquet caching.** `load_or_create_parquet` converts CSV to Parquet once and reuses it on subsequent cycles, which is why the log shows *"Reusing existing Parquet"* rather than repeating a multi-minute conversion.
+
+**Stream deduplication.** The Parquet archive is append-only, so replaying the producer or resetting Kafka offsets writes the same events twice. `dropDuplicates` on the streamed side prevents each retrain cycle from training on an inflated, artificially reweighted copy of the same sessions.
+
+---
+
+## 11. AWS RDS migration
+
+To move the data tier to a managed cloud database:
+
+1. **Provision.** Launch an RDS instance with the **MySQL Community Edition** engine under the Free Tier. Set the VPC security group to allow inbound TCP on port `3306` from your host's public IP.
+2. **Apply the schema.** Connect via DBeaver, MySQL Workbench, or the `mysql` CLI and run `mysql-init/init.sql`. The container's auto-init does not apply to RDS.
+3. **Repoint credentials.** In `.env`:
 
     ```ini
-    MYSQL_HOST=your-instance-id.cluster-hash.us-east-1.rds.amazonaws.com
+    MYSQL_HOST=your-instance.abcdefgh.us-east-1.rds.amazonaws.com
     MYSQL_DATABASE=model_registry
-    MYSQL_USER=your_aws_rds_username
-    MYSQL_PASSWORD=your_aws_rds_secure_password
+    MYSQL_USER=your_rds_user
+    MYSQL_PASSWORD=your_rds_password
     ```
 
-4. **Optimize Resource Limits:** Open your `docker-compose.yml` file and completely remove or comment out the `mysql` service container block. This frees up valuable RAM and local CPU allocation cycles. Run `docker compose up -d` to resume system functions over your cloud data storage tier.
+4. **Drop the local container.** Comment out or remove the `mysql` service block in `docker-compose.yml`, along with the `mysql` entries under each service's `depends_on`, then `docker compose up -d`. This also frees roughly 750 MB of RAM.
+
+Note that `MYSQL_HOST` is currently hardcoded to `mysql` in the `docker-compose.yml` environment blocks for `streaming-job`, `training-job`, and `django-dashboard`. Change those to `${MYSQL_HOST:-mysql}` so the `.env` value takes effect.
+
+---
+
+## 12. Cluster overview
+
+![Cluster overview](screenshots/system_architecture.png)
