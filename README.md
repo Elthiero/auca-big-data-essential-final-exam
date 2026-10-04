@@ -6,13 +6,15 @@ Instructor: Dr. Kundan Kumar
 
 **Group members**
 
-| Name |
-|---|
-| Ahourdet Donambi Thierry |
-| Emmanuel Manzi |
-| Gwiza Rodrigue |
-| Niyindora Emile |
-| SHEMA Joshua |
+| ID | Name |
+|---|---|
+| 101201 | Ahourdet Donambi Thierry |
+| XXXXXX | Emmanuel Manzi |
+| XXXXXX | Gwiza Rodrigue |
+| XXXXXX | Niyindora Emile |
+| XXXXXX | SHEMA Joshua |
+
+[View Report Document](report/BDE_final_exam.pdf)
 
 ---
 
@@ -146,6 +148,8 @@ This is the pipeline's most dangerous failure mode because it is silent. A *miss
 │   ├── Dockerfile  requirements.txt
 ├── mysql-init/init.sql                      # schema, auto-applied on first MySQL boot
 ├── screenshots/                             # evidence captures referenced below
+├── report/
+│   ├── BDE_final_exam                       # Report of the project
 ├── scripts/
 │   ├── create_kafka_topic.sh                # creates the topic with 3 partitions
 │   ├── load_to_hdfs.sh                      # pushes the raw CSVs into HDFS
