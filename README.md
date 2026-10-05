@@ -9,10 +9,10 @@ Instructor: Dr. Kundan Kumar
 | ID | Name |
 |---|---|
 | 101201 | Ahourdet Donambi Thierry |
-| XXXXXX | Emmanuel Manzi |
-| XXXXXX | Gwiza Rodrigue |
-| XXXXXX | Niyindora Emile |
-| XXXXXX | SHEMA Joshua |
+| 101341 | Emmanuel Manzi |
+| 101209 | Gwiza Rodrigue |
+| 100903 | Niyindora Emile |
+| 101342 | SHEMA Joshua |
 
 [View Report Document](report/BDE_final_exam.pdf)
 
